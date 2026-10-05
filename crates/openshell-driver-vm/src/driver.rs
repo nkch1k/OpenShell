@@ -1378,19 +1378,11 @@ impl VmDriver {
         let image_disk = image_plan.image_disk;
         let owner_source_disk = image_disk.as_ref().unwrap_or(&root_disk).clone();
         let overlay_disk = disk_paths.overlay_disk;
-        let boundary_generation =
-            match tokio::fs::read_to_string(state_dir.join(HOST_BOUNDARY_GENERATION_FILE)).await {
-                Ok(generation) if !generation.trim().is_empty() => generation.trim().to_string(),
-                Ok(_) => random_boundary_token(),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    random_boundary_token()
-                }
-                Err(error) => {
-                    return Err(Status::internal(format!(
-                        "read VM boundary generation: {error}"
-                    )));
-                }
-            };
+        let boundary_generation = launch_boundary_generation(
+            &state_dir,
+            &launch_authentication.supervisor.runtime_generation,
+        )
+        .await?;
         self.publish_platform_event(
             sandbox.id.clone(),
             platform_event(
@@ -1918,7 +1910,9 @@ impl VmDriver {
                             "read active VM sandbox generation: {error}"
                         ))
                     })?;
-            if active_generation.trim() != generation.as_str() {
+            if active_generation.trim() != generation.as_str()
+                && !persisted_launch_generation_matches(&state_dir, &generation).await
+            {
                 return Err(Status::failed_precondition(format!(
                     "VM sandbox is already running generation {}",
                     active_generation.trim()
@@ -5904,12 +5898,43 @@ fn merged_environment(sandbox: &Sandbox) -> HashMap<String, String> {
     environment
 }
 
-fn random_boundary_token() -> String {
-    let mut token = String::with_capacity(64);
-    for byte in rand::random::<[u8; 32]>() {
-        write!(&mut token, "{byte:02x}").expect("writing to String cannot fail");
+/// Generation that names a launch's boundary material. An explicit start
+/// persists the gateway's generation before provisioning. A first launch has
+/// no marker yet and takes the generation from its launch authentication, so
+/// the marker matches what the gateway sends on a later start.
+async fn launch_boundary_generation(
+    state_dir: &Path,
+    launch_generation: &openshell_core::sandbox_generation::SandboxGenerationId,
+) -> Result<String, Status> {
+    match tokio::fs::read_to_string(state_dir.join(HOST_BOUNDARY_GENERATION_FILE)).await {
+        Ok(generation) if !generation.trim().is_empty() => Ok(generation.trim().to_string()),
+        Ok(_) => Ok(launch_generation.to_string()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Ok(launch_generation.to_string())
+        }
+        Err(error) => Err(Status::internal(format!(
+            "read VM boundary generation: {error}"
+        ))),
     }
-    token
+}
+
+/// Sandboxes first launched before the marker carried the gateway generation
+/// hold a driver-local token there. Their gateway generation is still recorded
+/// in the persisted launch authentication.
+async fn persisted_launch_generation_matches(
+    state_dir: &Path,
+    generation: &openshell_core::sandbox_generation::SandboxGenerationId,
+) -> bool {
+    let Ok(sandbox) = read_sandbox_request(&state_dir.join(SANDBOX_REQUEST_FILE)).await else {
+        return false;
+    };
+    decode_launch_authentication(
+        sandbox
+            .spec
+            .as_ref()
+            .map_or(&[], |spec| spec.launch_authentication.as_slice()),
+    )
+    .is_ok_and(|authentication| authentication.supervisor.runtime_generation == *generation)
 }
 
 fn build_guest_environment(sandbox: &Sandbox, config: &VmDriverConfig) -> Vec<String> {
@@ -9665,6 +9690,103 @@ mod tests {
             .start_sandbox(&sandbox.id, &sandbox.name, "g0000000000000001", Vec::new())
             .await
             .expect("matching already-running start must remain an idempotent no-op");
+
+        let task = driver
+            .registry
+            .lock()
+            .await
+            .remove(&sandbox.id)
+            .and_then(|record| record.provisioning_task)
+            .unwrap();
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn first_launch_records_gateway_generation_as_boundary_marker() {
+        let temp = tempfile::tempdir().unwrap();
+        let launch_generation =
+            openshell_core::sandbox_generation::SandboxGenerationId::parse("generation-1")
+                .expect("runtime generation");
+
+        assert_eq!(
+            launch_boundary_generation(temp.path(), &launch_generation)
+                .await
+                .unwrap(),
+            "generation-1"
+        );
+
+        tokio::fs::write(
+            temp.path().join(HOST_BOUNDARY_GENERATION_FILE),
+            b"g0000000000000002\n",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            launch_boundary_generation(temp.path(), &launch_generation)
+                .await
+                .unwrap(),
+            "g0000000000000002",
+            "an explicit start's persisted generation must win"
+        );
+    }
+
+    #[tokio::test]
+    async fn already_running_start_matches_gateway_generation_of_first_launch() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut driver = test_driver_with_extensions(LifecycleExtensionRegistry::new());
+        driver.config.state_dir = temp.path().to_path_buf();
+        let sandbox = Sandbox {
+            id: "sandbox-first-launch".to_string(),
+            name: "first-launch".to_string(),
+            spec: Some(SandboxSpec {
+                launch_authentication: test_launch_authentication("existing").0,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let state_dir = temp.path().join("sandboxes").join(&sandbox.id);
+        create_private_dir_all(&state_dir).await.unwrap();
+        write_sandbox_request(&state_dir, &sandbox).await.unwrap();
+        // Sandboxes first launched before the marker carried the gateway
+        // generation hold a random token here.
+        tokio::fs::write(
+            state_dir.join(HOST_BOUNDARY_GENERATION_FILE),
+            "5f".repeat(32),
+        )
+        .await
+        .unwrap();
+        let provisioning_task = tokio::spawn(std::future::pending());
+        let snapshot = sandbox_snapshot(&sandbox, provisioning_condition(), false);
+        driver.registry.lock().await.insert(
+            sandbox.id.clone(),
+            SandboxRecord {
+                snapshot,
+                state_dir,
+                process: None,
+                provisioning_task: Some(provisioning_task),
+                preparation: None,
+                gpu_bdf: None,
+                deleting: false,
+            },
+        );
+
+        driver
+            .start_sandbox(&sandbox.id, &sandbox.name, "generation-1", Vec::new())
+            .await
+            .expect("start for the generation the sandbox was launched with must match");
+
+        let error = driver
+            .start_sandbox(&sandbox.id, &sandbox.name, "g0000000000000002", Vec::new())
+            .await
+            .expect_err("start for another generation must still be rejected");
+        assert_eq!(error.code(), Code::FailedPrecondition);
+        assert!(
+            error
+                .message()
+                .starts_with("VM sandbox is already running generation"),
+            "unexpected message: {}",
+            error.message()
+        );
 
         let task = driver
             .registry
